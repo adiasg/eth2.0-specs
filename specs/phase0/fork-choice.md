@@ -265,28 +265,6 @@ def get_head(store: Store) -> Root:
         head = max(children, key=lambda root: (get_latest_attesting_balance(store, root), root))
 ```
 
-#### `get_cbc_head`
-
-```python
-# Returns the result of running LMD GHOST starting from ``store.cbc_finalized_checkpoint``, and using the latest messages included in the chain
-def get_cbc_head(store: Store) -> Root:
-    # Get filtered block tree that only includes branches descending from the last finalized checkpoint
-    base = store.finalized_checkpoint.root
-    blocks: Dict[Root, BeaconBlock] = {}
-    filter_block_tree(store, base, blocks)
-    # Execute the LMD-GHOST fork choice starting from the last finalized checkpoint
-    head = store.finalized_checkpoint.root
-    while True:
-        children = [
-            root for root in blocks.keys()
-            if blocks[root].parent_root == head
-        ]
-        if len(children) == 0:
-            return head
-        # Sort by latest attesting balance with ties broken lexicographically
-        head = max(children, key=lambda root: (get_latest_cbc_attesting_balance_in_chain(store, head, root), root))
-```
-
 #### `should_update_justified_checkpoint`
 
 ```python
@@ -386,7 +364,7 @@ def validate_attestation_from_chain(store: Store, block: BeaconBlock, attestatio
         if len(children) == 0:
             return False
         # Sort by latest attesting balance with ties broken lexicographically
-        head = max(children, key=lambda root: (get_latest_cbc_attesting_balance_in_chain(store, head, root), root))
+        head = max(children, key=lambda root: (get_latest_cbc_attesting_balance_in_chain(store, beacon_block_root, root), root))
     if head == beacon_block_root:
         return True
     return False
@@ -405,7 +383,7 @@ def update_latest_messages_from_chain(store: Store, lmd_list_source: Root, attes
             store.latest_messages_from_chain[lmd_list_source] = {}
         if i not in store.latest_messages_from_chain[lmd_list_source] or target.epoch > store.latest_messages_from_chain[lmd_list_source][i].epoch:
             try:
-                # TODO: Something weird happening here - the LatestMessage is iterpreted as the one from the Phase 1 spec, even in the Phase 0 tests!
+                # FIXME: Something weird happening here - the LatestMessage is iterpreted to be the one from Phase 1 spec, even in Phase 0 tests!
                 store.latest_messages_from_chain[lmd_list_source][i] = LatestMessage(epoch=target.epoch, root=beacon_block_root)
             except TypeError:
                 store.latest_messages_from_chain[lmd_list_source][i] = LatestMessage(epoch=target.epoch, root=beacon_block_root, shard=None, shard_root=None )
