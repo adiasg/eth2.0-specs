@@ -84,11 +84,15 @@ class Store(object):
     genesis_time: uint64
     justified_checkpoint: Checkpoint
     finalized_checkpoint: Checkpoint
+    # Stores the latest CBC finalized checkpoint
+    cbc_finalized_checkpoint: Checkpoint
     best_justified_checkpoint: Checkpoint
     blocks: Dict[Root, BeaconBlock] = field(default_factory=dict)
     block_states: Dict[Root, BeaconState] = field(default_factory=dict)
     checkpoint_states: Dict[Checkpoint, BeaconState] = field(default_factory=dict)
     latest_messages: Dict[ValidatorIndex, LatestMessage] = field(default_factory=dict)
+    # Stores the latest message list from messages that are included in the chain of the block with provided root
+    latest_messages_from_chain: Dict[Root, Dict[ValidatorIndex, LatestMessage]] = field(default_factory=dict)
 ```
 
 #### `get_forkchoice_store`
@@ -109,6 +113,7 @@ def get_forkchoice_store(anchor_state: BeaconState) -> Store:
     anchor_epoch = get_current_epoch(anchor_state)
     justified_checkpoint = Checkpoint(epoch=anchor_epoch, root=anchor_root)
     finalized_checkpoint = Checkpoint(epoch=anchor_epoch, root=anchor_root)
+    cbc_finalized_checkpoint = Checkpoint(epoch=anchor_epoch, root=anchor_root)
     return Store(
         time=uint64(anchor_state.genesis_time + SECONDS_PER_SLOT * anchor_state.slot),
         genesis_time=anchor_state.genesis_time,
@@ -118,6 +123,7 @@ def get_forkchoice_store(anchor_state: BeaconState) -> Store:
         blocks={anchor_root: anchor_block_header},
         block_states={anchor_root: copy(anchor_state)},
         checkpoint_states={justified_checkpoint: copy(anchor_state)},
+        cbc_finalized_checkpoint=cbc_finalized_checkpoint,
     )
 ```
 
@@ -166,6 +172,23 @@ def get_latest_attesting_balance(store: Store, root: Root) -> Gwei:
         state.validators[i].effective_balance for i in active_indices
         if (i in store.latest_messages
             and get_ancestor(store, store.latest_messages[i].root, store.blocks[root].slot) == root)
+    ))
+```
+
+#### `get_latest_cbc_attesting_balance_in_chain`
+
+```python
+# Gets the latest attesting balance for a particular block from the messages included in the chain defined by ``lmd_list_source``
+def get_latest_cbc_attesting_balance_in_chain(store: Store, lmd_list_source: Root, root: Root) -> Gwei:
+    state = store.block_states[lmd_list_source]
+    active_indices = get_active_validator_indices(state, get_current_epoch(state))
+    if lmd_list_source not in store.latest_messages_from_chain:
+        # This happens only when ``lmd_list_source`` is genesis or that ``lmd_list_source`` has no attestations?
+        return Gwei(0)
+    return Gwei(sum(
+        state.validators[i].effective_balance for i in active_indices
+        if (i in store.latest_messages_from_chain[lmd_list_source]
+            and get_ancestor(store, store.latest_messages_from_chain[lmd_list_source][i].root, store.blocks[root].slot) == root)
     ))
 ```
 
@@ -240,6 +263,28 @@ def get_head(store: Store) -> Root:
             return head
         # Sort by latest attesting balance with ties broken lexicographically
         head = max(children, key=lambda root: (get_latest_attesting_balance(store, root), root))
+```
+
+#### `get_cbc_head`
+
+```python
+# Returns the result of running LMD GHOST starting from ``store.cbc_finalized_checkpoint``, and using the latest messages included in the chain
+def get_cbc_head(store: Store) -> Root:
+    # Get filtered block tree that only includes branches descending from the last finalized checkpoint
+    base = store.finalized_checkpoint.root
+    blocks: Dict[Root, BeaconBlock] = {}
+    filter_block_tree(store, base, blocks)
+    # Execute the LMD-GHOST fork choice starting from the last finalized checkpoint
+    head = store.finalized_checkpoint.root
+    while True:
+        children = [
+            root for root in blocks.keys()
+            if blocks[root].parent_root == head
+        ]
+        if len(children) == 0:
+            return head
+        # Sort by latest attesting balance with ties broken lexicographically
+        head = max(children, key=lambda root: (get_latest_cbc_attesting_balance_in_chain(store, head, root), root))
 ```
 
 #### `should_update_justified_checkpoint`
@@ -319,6 +364,61 @@ def update_latest_messages(store: Store, attesting_indices: Sequence[ValidatorIn
             store.latest_messages[i] = LatestMessage(epoch=target.epoch, root=beacon_block_root)
 ```
 
+##### `validate_attestation_from_chain`
+
+```python
+# Validates that the ``beacon_block_root`` of the attestation included in ``block`` is the result of running LMD GHOST on the attestations included in the chain defined by ``beacon_block_root``
+def validate_attestation_from_chain(store: Store, block: BeaconBlock, attestation: Attestation) -> None:
+    beacon_block_root = attestation.data.beacon_block_root
+    beacon_block_root_slot = store.blocks[beacon_block_root].slot
+
+    # Get filtered block tree that only includes branches descending from the latest finalized checkpoint
+    base = store.finalized_checkpoint.root
+    blocks: Dict[Root, BeaconBlock] = {}
+    filter_block_tree(store, base, blocks)
+    # Execute the LMD-GHOST fork choice starting from the latest finalized checkpoint
+    head = store.finalized_checkpoint.root
+    while store.blocks[head].slot < beacon_block_root_slot:
+        children = [
+            root for root in blocks.keys()
+            if blocks[root].parent_root == head
+        ]
+        if len(children) == 0:
+            return False
+        # Sort by latest attesting balance with ties broken lexicographically
+        head = max(children, key=lambda root: (get_latest_cbc_attesting_balance_in_chain(store, head, root), root))
+    if head == beacon_block_root:
+        return True
+    return False
+```
+
+##### `update_latest_messages_from_chain`
+
+```python
+# Stores the latest message list from attestations included in the chain defined by ``lmd_list_source``
+# Run this only on attestations included in blocks
+def update_latest_messages_from_chain(store: Store, lmd_list_source: Root, attesting_indices: Sequence[ValidatorIndex], attestation: Attestation) -> None:
+    target = attestation.data.target
+    beacon_block_root = attestation.data.beacon_block_root
+    for i in attesting_indices:
+        if lmd_list_source not in store.latest_messages_from_chain:
+            store.latest_messages_from_chain[lmd_list_source] = {}
+        if i not in store.latest_messages_from_chain[lmd_list_source] or target.epoch > store.latest_messages_from_chain[lmd_list_source][i].epoch:
+            try:
+                # TODO: Something weird happening here - the LatestMessage is iterpreted as the one from the Phase 1 spec, even in the Phase 0 tests!
+                store.latest_messages_from_chain[lmd_list_source][i] = LatestMessage(epoch=target.epoch, root=beacon_block_root)
+            except TypeError:
+                store.latest_messages_from_chain[lmd_list_source][i] = LatestMessage(epoch=target.epoch, root=beacon_block_root, shard=None, shard_root=None )
+```
+
+##### `update_cbc_finalized_checkpoint`
+
+```python
+# Updates the latest CBC finalized checkpoint using a safety oracle and a safety threshold
+def update_cbc_finalized_checkpoint(store: Store, safety_threshold) -> None:
+    pass
+```
+
 
 ### Handlers
 
@@ -375,6 +475,7 @@ def on_block(store: Store, signed_block: SignedBeaconBlock) -> None:
     # Update finalized checkpoint
     if state.finalized_checkpoint.epoch > store.finalized_checkpoint.epoch:
         store.finalized_checkpoint = state.finalized_checkpoint
+        store.cbc_finalized_checkpoint = state.finalized_checkpoint
 
         # Potentially update justified if different from store
         if store.justified_checkpoint != state.current_justified_checkpoint:
@@ -388,6 +489,14 @@ def on_block(store: Store, signed_block: SignedBeaconBlock) -> None:
             ancestor_at_finalized_slot = get_ancestor(store, store.justified_checkpoint.root, finalized_slot)
             if ancestor_at_finalized_slot != store.finalized_checkpoint.root:
                 store.justified_checkpoint = state.current_justified_checkpoint
+
+    for attestation in block.body.attestations:
+        if validate_attestation_from_chain(store, block, attestation):
+            # This means ``attestation.beacon_block_root`` is the result of LMD GHOST run on attestations included in the chain of this block
+            target_state = store.block_states[attestation.data.target.root]
+            indexed_attestation = get_indexed_attestation(target_state, attestation)
+            update_latest_messages_from_chain(store, hash_tree_root(block), indexed_attestation.attesting_indices, attestation)
+    update_cbc_finalized_checkpoint(store, 0.51)
 ```
 
 #### `on_attestation`
