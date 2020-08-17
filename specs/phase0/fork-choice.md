@@ -124,6 +124,7 @@ def get_forkchoice_store(anchor_state: BeaconState) -> Store:
         block_states={anchor_root: copy(anchor_state)},
         checkpoint_states={justified_checkpoint: copy(anchor_state)},
         cbc_finalized_checkpoint=cbc_finalized_checkpoint,
+        latest_messages_from_chain={anchor_root:{}},
     )
 ```
 
@@ -180,11 +181,9 @@ def get_latest_attesting_balance(store: Store, root: Root) -> Gwei:
 ```python
 # Gets the latest attesting balance for a particular block from the messages included in the chain defined by ``lmd_list_source``
 def get_latest_cbc_attesting_balance_in_chain(store: Store, lmd_list_source: Root, root: Root) -> Gwei:
+    assert lmd_list_source in store.latest_messages_from_chain
     state = store.block_states[lmd_list_source]
     active_indices = get_active_validator_indices(state, get_current_epoch(state))
-    if lmd_list_source not in store.latest_messages_from_chain:
-        # This happens only when ``lmd_list_source`` is genesis or that ``lmd_list_source`` has no attestations?
-        return Gwei(0)
     return Gwei(sum(
         state.validators[i].effective_balance for i in active_indices
         if (i in store.latest_messages_from_chain[lmd_list_source]
@@ -375,18 +374,22 @@ def validate_attestation_from_chain(store: Store, block: BeaconBlock, attestatio
 ```python
 # Stores the latest message list from attestations included in the chain defined by ``lmd_list_source``
 # Run this only on attestations included in blocks
-def update_latest_messages_from_chain(store: Store, lmd_list_source: Root, attesting_indices: Sequence[ValidatorIndex], attestation: Attestation) -> None:
-    target = attestation.data.target
+def update_latest_messages_from_chain(store: Store, lmd_list_source: BeaconBlock, attesting_indices: Sequence[ValidatorIndex], attestation: Attestation) -> None:
+    block_root = hash_tree_root(lmd_list_source)
+    target = attestation.data.target # REVIEW: Should this use attestation.data.slot instead of target, since the same validator can have more than 1 attestations in the same epoch?
     beacon_block_root = attestation.data.beacon_block_root
+
+    if block_root not in store.latest_messages_from_chain:
+        # Copy the latest message list from the parent block
+        store.latest_messages_from_chain[block_root] = store.latest_messages_from_chain[lmd_list_source.parent_root]
+
     for i in attesting_indices:
-        if lmd_list_source not in store.latest_messages_from_chain:
-            store.latest_messages_from_chain[lmd_list_source] = {}
-        if i not in store.latest_messages_from_chain[lmd_list_source] or target.epoch > store.latest_messages_from_chain[lmd_list_source][i].epoch:
+        if i not in store.latest_messages_from_chain[block_root] or target.epoch > store.latest_messages_from_chain[block_root][i].epoch:
             try:
                 # FIXME: Something weird happening here - the LatestMessage is iterpreted to be the one from Phase 1 spec, even in Phase 0 tests!
-                store.latest_messages_from_chain[lmd_list_source][i] = LatestMessage(epoch=target.epoch, root=beacon_block_root)
+                store.latest_messages_from_chain[block_root][i] = LatestMessage(epoch=target.epoch, root=beacon_block_root)
             except TypeError:
-                store.latest_messages_from_chain[lmd_list_source][i] = LatestMessage(epoch=target.epoch, root=beacon_block_root, shard=None, shard_root=None )
+                store.latest_messages_from_chain[block_root][i] = LatestMessage(epoch=target.epoch, root=beacon_block_root, shard=None, shard_root=None )
 ```
 
 ##### `update_cbc_finalized_checkpoint`
@@ -473,7 +476,7 @@ def on_block(store: Store, signed_block: SignedBeaconBlock) -> None:
             # This means ``attestation.beacon_block_root`` is the result of LMD GHOST run on attestations included in the chain of this block
             target_state = store.block_states[attestation.data.target.root]
             indexed_attestation = get_indexed_attestation(target_state, attestation)
-            update_latest_messages_from_chain(store, hash_tree_root(block), indexed_attestation.attesting_indices, attestation)
+            update_latest_messages_from_chain(store, block, indexed_attestation.attesting_indices, attestation)
     update_cbc_finalized_checkpoint(store, 0.51)
 ```
 
